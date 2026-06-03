@@ -1,4 +1,32 @@
+import sys
+import multiprocessing
+
+# 1. CRITICAL PYINSTALLER MULTIPROCESSING GUARD (Must run before imports)
+if __name__ == "__main__":
+    multiprocessing.freeze_support()
+
+    # Catch OpenVINO background workers immediately
+    if len(sys.argv) > 1 and (
+        'forkserver' in sys.argv[1] or 'resource_tracker' in sys.argv[1]
+    ):
+        pass
+else:
+    # If this file is being imported by a worker via a forkserver
+    if len(sys.argv) > 1 and (
+        'forkserver' in sys.argv[1] or 'resource_tracker' in sys.argv[1]
+    ):
+        sys.exit(0)
+
+# 2. FIX SSL CERTIFICATE REDIRECTION FOR FROZEN ENVIRONMENT
 import os
+if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+    cert_path = os.path.join(sys._MEIPASS, 'certifi', 'cacert.pem')
+    if os.path.exists(cert_path):
+        os.environ['REQUESTS_CA_BUNDLE'] = cert_path
+        os.environ['CURL_CA_BUNDLE'] = cert_path
+        os.environ['SSL_CERT_FILE'] = cert_path
+
+# 3. HEAVY IMPORTS (Safe from recursive multiprocessing pollution)
 import csv
 import argparse
 import numpy as np
@@ -10,14 +38,12 @@ VALID_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tiff')
 
 
 def download_model_files(repo_id):
-    """
-    Downloads the ONNX model and the tags CSV from a specified
-    Hugging Face repository.
-    """
-    print(
-        f"Fetching model artifacts from Hugging Face repository: {repo_id}...")
+    """Downloads model files from a specified Hugging Face repository."""
+    print(f"Fetching model artifacts from HF repository: {repo_id}...")
     model_path = hf_hub_download(repo_id=repo_id, filename="model.onnx")
-    tags_path = hf_hub_download(repo_id=repo_id, filename="selected_tags.csv")
+    tags_path = hf_hub_download(
+        repo_id=repo_id, filename="selected_tags.csv"
+    )
     return model_path, tags_path
 
 
@@ -30,61 +56,59 @@ def load_tags(tags_csv_path):
 
 
 def preprocess_image(image_path, target_size):
-    """Resizes, pads, and normalizes the image to match model specifications."""
+    """Resizes, pads, and normalizes the image to match model specs."""
     img = Image.open(image_path).convert('RGB')
 
-    # Calculate padding to preserve aspect ratio
     old_size = img.size
     ratio = float(target_size) / max(old_size)
     new_size = tuple([int(x * ratio) for x in old_size])
     img = img.resize(new_size, Image.Resampling.LANCZOS)
 
-    # Create canvas and paste image into center (using a white background)
     new_img = Image.new("RGB", (target_size, target_size), (255, 255, 255))
-    new_img.paste(img, ((target_size - new_size[0]) // 2,
-                        (target_size - new_size[1]) // 2))
+    new_img.paste(
+        img,
+        ((target_size - new_size[0]) // 2, (target_size - new_size[1]) // 2)
+    )
 
-    # Convert to BGR array as expected by the SmilingWolf vision pipeline
     img_array = np.array(new_img, dtype=np.float32)
     img_array = img_array[:, :, ::-1]  # RGB to BGR
 
-    # Expand dims to represent batch size [1, H, W, 3]
     return np.expand_dims(img_array, axis=0)
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Auto-tag images using tagger models via OpenVINO.")
+    desc = "Auto-tag images using SmilingWolf tagger models via OpenVINO."
+    parser = argparse.ArgumentParser(description=desc)
     parser.add_argument(
-        "directory", type=str, help="Directory containing images to tag.")
+        "directory", type=str, help="Directory containing images to tag."
+    )
     parser.add_argument(
         "-m", "--model", type=str,
         default="SmilingWolf/wd-v1-4-moat-tagger-v2",
-        help=(
-            "Hugging Face repository ID for the target model "
-            "(default: SmilingWolf/wd-v1-4-moat-tagger-v2)."
-        )
+        help="Hugging Face repository ID for the target model."
     )
     parser.add_argument(
         "-d", "--dry-run", action="store_true",
-        help="Print tags to stdout instead of saving to file.")
+        help="Print tags to stdout instead of saving to file."
+    )
     parser.add_argument(
         "-c", "--confidence", type=float, default=0.37,
-        help="Tag confidence threshold (default: 0.37).")
+        help="Tag confidence threshold (default: 0.37)."
+    )
     parser.add_argument(
         "-g", "--gpu", type=str, default="GPU",
-        help="Target hardware accelerator device index (default: GPU).")
+        help="Target hardware accelerator device index (default: GPU)."
+    )
     parser.add_argument(
         "-u", "--keep-underscores", action="store_true",
-        help="Keep underscores in tags instead of replacing them with spaces.")
+        help="Keep underscores in tags instead of replacing with spaces."
+    )
     args = parser.parse_args()
 
     if not os.path.isdir(args.directory):
-        print(f"Error: Target directory '{args.directory}' does not exist "
-              "or is not a directory.")
+        print(f"Error: Directory '{args.directory}' does not exist.")
         return
 
-    # 1. Prepare assets from the designated repository
     try:
         model_path, tags_path = download_model_files(args.model)
     except Exception as e:
@@ -93,12 +117,10 @@ def main():
 
     tags_list = load_tags(tags_path)
 
-    # 2. Initialize Core OpenVINO Runtime
     core = ov.Core()
     print("Loading model graph into OpenVINO...")
     model = core.read_model(model_path)
 
-    # Configure FP16 execution hint for the hardware compiler
     core.set_property(args.gpu, {"INFERENCE_PRECISION_HINT": "f16"})
 
     print(f"Compiling model for target hardware device: {args.gpu}")
@@ -108,24 +130,21 @@ def main():
     input_layer = compiled_model.input(0)
     output_layer = compiled_model.output(0)
 
-    # Dynamically extract image resolution from the model's structural inputs
     shape = input_layer.shape
-    if shape[1] == 3:  # NCHW format
+    if shape[1] == 3:
         image_size = shape[2]
-    else:              # NHWC format (Default for MOAT/ConvNeXt ONNX models)
+    else:
         image_size = shape[1]
 
-    print(
-        "Detected model input resolution requirement: "
-        f"{image_size}x{image_size}")
+    print(f"Detected model input resolution requirement: {image_size}x")
 
-    # Scan target directory for images
     files = [
-        os.path.join(args.directory, f)
-        for f in os.listdir(args.directory)]
+        os.path.join(args.directory, f) for f in os.listdir(args.directory)
+    ]
     image_paths = [
-        f for f in files if os.path.isfile(f)
-        and f.lower().endswith(VALID_EXTENSIONS)]
+        f for f in files
+        if os.path.isfile(f) and f.lower().endswith(VALID_EXTENSIONS)
+    ]
 
     if not image_paths:
         print(f"No matching images found in directory: {args.directory}")
@@ -133,7 +152,6 @@ def main():
 
     print(f"Found {len(image_paths)} images to process.\n")
 
-    # 3. Process Batch Loop
     for image_path in image_paths:
         try:
             processed_image = preprocess_image(image_path, image_size)
@@ -141,7 +159,6 @@ def main():
             results_dict = infer_request.infer({input_layer: processed_image})
             probs = results_dict[output_layer][0]
 
-            # Extract tags that clear the required threshold
             matched_tags = []
             for i, prob in enumerate(probs):
                 if prob >= args.confidence:
@@ -153,27 +170,28 @@ def main():
             tag_string = ", ".join(matched_tags)
 
             if args.dry_run:
-                print(
-                    "--- Dry Run Results for: "
-                    f"{os.path.basename(image_path)} ---")
-                print(
-                    tag_string if tag_string
-                    else "[No tags matched threshold]")
+                name = os.path.basename(image_path)
+                print(f"--- Dry Run Results for: {name} ---")
+                print(tag_string if tag_string else "[No tags matched]")
                 print("-" * 40 + "\n")
             else:
-                # Replace image extension with .txt
                 txt_path = os.path.splitext(image_path)[0] + ".txt"
                 with open(txt_path, "w", encoding="utf-8") as txt_file:
                     txt_file.write(tag_string)
                 print(
-                    f"Successfully processed: {os.path.basename(image_path)} "
-                    f"-> {os.path.basename(txt_path)}")
+                    f"Successfully processed: {os.path.basename(image_path)}"
+                    f" -> {os.path.basename(txt_path)}"
+                )
 
         except Exception as e:
-            print(
-                f"Failed to process {os.path.basename(image_path)}. "
-                f"Error: {e}")
+            name = os.path.basename(image_path)
+            print(f"Failed to process {name}. Error: {e}")
 
 
 if __name__ == "__main__":
-    main()
+    if not (
+        len(sys.argv) > 1 and (
+            'forkserver' in sys.argv[1] or 'resource_tracker' in sys.argv[1]
+        )
+    ):
+        main()
