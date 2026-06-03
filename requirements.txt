@@ -1,0 +1,5 @@
+huggingface_hub==1.17.0
+numpy==2.4.6
+onnxruntime==1.26.0
+openvino==2026.2.0
+pillow==12.2.0
