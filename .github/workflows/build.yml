@@ -1,0 +1,150 @@
+name: Build autotagger
+
+permissions:
+  contents: write
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        distro: [archlinux, ubuntu]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build on Arch Linux
+        if: matrix.distro == 'archlinux'
+        uses: addnab/docker-run-action@v3
+        with:
+          image: archlinux:latest
+          options: -v ${{ github.workspace }}:/workspace
+          run: |
+            cd /workspace
+            
+            # Update system and install dependencies
+            pacman -Sy --noconfirm archlinux-keyring
+            pacman -Syu --noconfirm python python-pip base-devel openssl git zip \
+            onetbb pugixml
+            
+            # Install Python dependencies
+            pip install --break-system-packages -r requirements.txt
+            
+            # Build with PyInstaller
+            pyinstaller --clean autotagger.spec
+
+      - name: Build on Ubuntu
+        if: matrix.distro == 'ubuntu'
+        run: |
+          # Install system dependencies
+          sudo apt update
+          sudo apt install -y openssl zip python3 python3-pip python3-venv git
+          
+          # Install Python dependencies
+          pip install -r requirements.txt
+          
+          # Build with PyInstaller
+          pyinstaller --clean autotagger.spec
+
+      - name: Upload Arch Linux artifact
+        if: matrix.distro == 'archlinux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: autotagger-archlinux
+          path: dist/autotagger
+
+      - name: Upload Ubuntu artifact
+        if: matrix.distro == 'ubuntu'
+        uses: actions/upload-artifact@v4
+        with:
+          name: autotagger-ubuntu
+          path: dist/autotagger
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download Arch Linux artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: autotagger-archlinux
+          path: ./artifacts/archlinux
+
+      - name: Download Ubuntu artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: autotagger-ubuntu
+          path: ./artifacts/ubuntu
+
+      - name: Create zip archives
+        run: |
+          sudo apt-get update && sudo apt-get install -y zip
+          cd artifacts/archlinux
+          zip ../autotagger-archlinux.zip autotagger
+          cd ../ubuntu
+          zip ../autotagger-ubuntu.zip autotagger
+          cd ..
+
+      - name: Generate release notes
+        id: release_notes
+        run: |
+          # Get the tag name
+          TAG_NAME=${GITHUB_REF#refs/tags/}
+          
+          # Get the previous tag
+          PREV_TAG=$(git describe --tags --abbrev=0 \
+            "${TAG_NAME}^" 2>/dev/null || echo "")
+          
+          # Generate changelog
+          if [ -n "$PREV_TAG" ]; then
+            echo "## Changes since ${PREV_TAG}" > notes.md
+            echo "" >> notes.md
+            git log ${PREV_TAG}..${TAG_NAME} \
+              --pretty=format:"* %s (%h)" >> notes.md
+          else
+            echo "## Initial Release" > notes.md
+          fi
+          
+          echo "" >> notes.md
+          echo "## Downloads" >> notes.md
+          echo "" >> notes.md
+          echo "* \`autotagger-archlinux.zip\` - Arch Linux build" \
+            >> notes.md
+          echo "* \`autotagger-ubuntu.zip\` - Ubuntu build" >> notes.md
+
+      - name: Check if pre-release
+        id: prerelease
+        run: |
+          TAG_NAME=${GITHUB_REF#refs/tags/}
+          if echo "$TAG_NAME" | grep -qE '(alpha|beta|rc|pre)'; then
+            echo "is_prerelease=true" >> $GITHUB_OUTPUT
+          else
+            echo "is_prerelease=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          name: ${{ github.ref_name }}
+          body_path: notes.md
+          files: |
+            ./artifacts/autotagger-archlinux.zip
+            ./artifacts/autotagger-ubuntu.zip
+          prerelease: ${{ steps.prerelease.outputs.is_prerelease }}
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
